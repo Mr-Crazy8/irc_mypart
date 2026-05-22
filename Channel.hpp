@@ -28,7 +28,8 @@ private:
     std::set<int>    invited;       // fds of clients who have been /INVITE'd
 
 public:
-    // ── Constructor ──────────────────────────────────────────────────────────
+    // ── Constructors ─────────────────────────────────────────────────────────
+    Channel();
     Channel(const std::string& name);
 
     // ── Name ─────────────────────────────────────────────────────────────────

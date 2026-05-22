@@ -1,122 +1,483 @@
 #include "Server.hpp"
+#include <cctype>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// THIS FILE IS YOURS TO IMPLEMENT.
-//
-// All command handlers live here. Each function receives:
-//   - client : reference to the Client object that sent the message
-//   - msg    : the fully parsed Message (msg.params[0], msg.params[1], etc.)
-//
-// Use sendToClient(fd, string) to send any response.
-// Use getPrefix(client) to build ":nick!user@host" for outgoing messages.
-// Use findClientByNick(nick) to find another client by nickname.
-// Use findChannel(name) to find a channel by name.
-// channels["#name"] to create/access a channel in the map.
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Internal helpers (used only in this file) ────────────────────────────────
 
+// Returns true if the nickname string is valid IRC nickname format:
+//   - 1 to 9 characters
+//   - First char: letter or one of: _ \ [ ] { } | `
+//   - Remaining: letter, digit, or one of: - _ \ [ ] { } | `
+static bool isValidNick(const std::string& nick)
+{
+    if (nick.empty() || nick.size() > 9)
+        return false;
+    const std::string special = "_\\[]{}|`";
+    if (!std::isalpha((unsigned char)nick[0]) &&
+        special.find(nick[0]) == std::string::npos)
+        return false;
+    for (size_t i = 1; i < nick.size(); ++i)
+    {
+        char c = nick[i];
+        if (!std::isalnum((unsigned char)c) &&
+            special.find(c) == std::string::npos && c != '-')
+            return false;
+    }
+    return true;
+}
 
-// PASS — verify the connection password
-// msg.params[0] = the password the client sent
-//
-// What to do:
-//   1. If client is already authenticated, send 462 (already registered)
-//   2. If params is empty, send 461 (not enough params)
-//   3. Compare params[0] with server password
-//   4. If correct: client.set_password_status(true)
-//   5. If wrong:   send 464 (password incorrect) — you may also close the connection
-//   6. After setting password true, check if nick and user are also done.
-//      If all three are true: client.setAuthenticated(true) and send 001 welcome.
+// Checks whether all three registration steps are complete.
+// If yes, marks the client as authenticated and sends the welcome burst.
+static void checkAndFinishRegistration(Server* srv, Client& client,
+                                        void (Server::*sendFn)(int, const std::string&))
+{
+    if (client.password_status() && client.nickname_status() && client.username_status())
+    {
+        client.setAuthenticated(true);
+        // 001 RPL_WELCOME
+        (srv->*sendFn)(client.getFd(),
+            ":server 001 " + client.getnickname() +
+            " :Welcome to the IRC Network " +
+            client.getnickname() + "!" +
+            client.getUsername() + "@" +
+            client.getHostname());
+        // 002 RPL_YOURHOST
+        (srv->*sendFn)(client.getFd(),
+            ":server 002 " + client.getnickname() +
+            " :Your host is ircserv, running version 1.0");
+        // 003 RPL_CREATED
+        (srv->*sendFn)(client.getFd(),
+            ":server 003 " + client.getnickname() +
+            " :This server was created recently");
+        // 004 RPL_MYINFO
+        (srv->*sendFn)(client.getFd(),
+            ":server 004 " + client.getnickname() +
+            " ircserv 1.0 o itkol");
+    }
+}
+
+// ─── PASS ─────────────────────────────────────────────────────────────────────
+
 void Server::handlePass(Client& client, const Message& msg)
 {
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
+    // Already registered
+    if (client.isAuthenticated())
+    {
+        sendToClient(client.getFd(),
+            ":server 462 " + client.getnickname() + " :You may not reregister");
+        return;
+    }
+    // Missing parameter
+    if (msg.params.empty())
+    {
+        sendToClient(client.getFd(),
+            ":server 461 * PASS :Not enough parameters");
+        return;
+    }
+    // Wrong password
+    if (msg.params[0] != password)
+    {
+        sendToClient(client.getFd(),
+            ":server 464 * :Password incorrect");
+        removeClient(client.getFd());
+        return;
+    }
+    client.set_password_status(true);
+    checkAndFinishRegistration(this, client, &Server::sendToClient);
 }
 
+// ─── NICK ─────────────────────────────────────────────────────────────────────
 
-// NICK — set or change the client's nickname
-// msg.params[0] = desired nickname
-//
-// What to do:
-//   1. If params is empty, send 431 (no nickname given)
-//   2. Validate nickname format (letters, digits, some special chars — no spaces)
-//      If invalid, send 432 (erroneous nickname)
-//   3. Check if the nickname is already taken by another client (findClientByNick)
-//      If taken, send 433 (nickname already in use)
-//   4. Set the nickname: client.setNickname(params[0])
-//      client.set_nickname_status(true)
-//   5. If client is already authenticated and changes nick, broadcast to all
-//      channels they are in: ":oldnick!user@host NICK :newnick"
-//   6. Check if all three steps (pass, nick, user) are done.
-//      If yes: client.setAuthenticated(true) and send 001 welcome.
 void Server::handleNick(Client& client, const Message& msg)
 {
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
+    // Missing parameter
+    if (msg.params.empty())
+    {
+        sendToClient(client.getFd(),
+            ":server 431 " + client.getnickname() + " :No nickname given");
+        return;
+    }
+
+    const std::string& newNick = msg.params[0];
+
+    // Invalid format
+    if (!isValidNick(newNick))
+    {
+        sendToClient(client.getFd(),
+            ":server 432 " + client.getnickname() + " " + newNick +
+            " :Erroneous nickname");
+        return;
+    }
+
+    // Already in use by a different client
+    Client* existing = findClientByNick(newNick);
+    if (existing && existing->getFd() != client.getFd())
+    {
+        sendToClient(client.getFd(),
+            ":server 433 " + client.getnickname() + " " + newNick +
+            " :Nickname is already in use");
+        return;
+    }
+
+    std::string oldPrefix = getPrefix(client);
+    std::string oldNick   = client.getnickname();
+
+    client.setNickname(newNick);
+    client.set_nickname_status(true);
+
+    // If already registered, broadcast nick change to all shared channels
+    if (client.isAuthenticated())
+    {
+        std::string nickMsg = ":" + oldPrefix + " NICK :" + newNick;
+        // Collect unique fds that share a channel with this client
+        std::set<int> notified;
+        notified.insert(client.getFd());
+        sendToClient(client.getFd(), nickMsg);
+
+        for (std::map<std::string, Channel>::iterator ch = channels.begin();
+             ch != channels.end(); ++ch)
+        {
+            if (!ch->second.isMember(client.getFd()))
+                continue;
+            const std::set<int>& members = ch->second.getMembers();
+            for (std::set<int>::const_iterator m = members.begin();
+                 m != members.end(); ++m)
+            {
+                if (notified.find(*m) == notified.end())
+                {
+                    sendToClient(*m, nickMsg);
+                    notified.insert(*m);
+                }
+            }
+        }
+        return;
+    }
+
+    checkAndFinishRegistration(this, client, &Server::sendToClient);
 }
 
+// ─── USER ─────────────────────────────────────────────────────────────────────
 
-// USER — set username and realname (called once during registration)
-// msg.params[0] = username
-// msg.params[1] = mode (usually "0", can be ignored)
-// msg.params[2] = unused (usually "*")
-// msg.params[3] = realname (trailing param)
-//
-// What to do:
-//   1. If client is already authenticated, send 462 (already registered)
-//   2. If params.size() < 4, send 461 (not enough params)
-//   3. client.setUsername(params[0])
-//      client.setRealname(params[3])
-//      client.set_username_status(true)
-//   4. Check if all three steps are done.
-//      If yes: client.setAuthenticated(true) and send 001 welcome.
 void Server::handleUser(Client& client, const Message& msg)
 {
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
+    // Already registered
+    if (client.isAuthenticated())
+    {
+        sendToClient(client.getFd(),
+            ":server 462 " + client.getnickname() + " :You may not reregister");
+        return;
+    }
+    // Need at least 4 parameters: username mode unused :realname
+    if (msg.params.size() < 4)
+    {
+        sendToClient(client.getFd(),
+            ":server 461 * USER :Not enough parameters");
+        return;
+    }
+
+    client.setUsername(msg.params[0]);
+    client.setRealname(msg.params[3]);
+    client.set_username_status(true);
+
+    checkAndFinishRegistration(this, client, &Server::sendToClient);
 }
 
+// ─── JOIN ─────────────────────────────────────────────────────────────────────
 
-// JOIN — join or create a channel
-// msg.params[0] = channel name (e.g. "#general")
-// msg.params[1] = channel key, if any (optional)
-//
-// What to do:
-//   1. Check client.isAuthenticated() — send 451 if not
-//   2. Check params[0] exists and starts with '#' — send 461 if missing
-//   3. findChannel(params[0]):
-//      - If exists and has +i mode:   check isInvited — send 473 if not
-//      - If exists and has +k mode:   check params[1] matches key — send 475 if not
-//      - If exists and has +l mode:   check memberCount < limit — send 471 if full
-//      - If not exists:               create it: channels[lowercase_name] = Channel(name)
-//   4. channel.addMember(client.getFd())
-//   5. If channel was just created, also: channel.addOperator(client.getFd())
-//   6. Send to the joining client:
-//      ":nick!user@host JOIN #channel"
-//   7. If channel has a topic, send 332 to the joining client
-//      Otherwise send 331
-//   8. Send 353 (NAMES list) and 366 (end of names) to the joining client
 void Server::handleJoin(Client& client, const Message& msg)
 {
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
+    // Not registered
+    if (!client.isAuthenticated())
+    {
+        sendToClient(client.getFd(),
+            ":server 451 * :You have not registered");
+        return;
+    }
+    // Missing channel name
+    if (msg.params.empty())
+    {
+        sendToClient(client.getFd(),
+            ":server 461 " + client.getnickname() + " JOIN :Not enough parameters");
+        return;
+    }
+
+    const std::string& chanName = msg.params[0];
+
+    // Must start with #
+    if (chanName.empty() || chanName[0] != '#')
+    {
+        sendToClient(client.getFd(),
+            ":server 403 " + client.getnickname() + " " + chanName +
+            " :No such channel");
+        return;
+    }
+
+    std::string lowerName = toLower(chanName);
+    bool isNew = (channels.find(lowerName) == channels.end());
+
+    if (isNew)
+    {
+        // Create the channel
+        channels.insert(std::make_pair(lowerName, Channel(chanName)));
+    }
+
+    Channel& channel = channels[lowerName];
+
+    // Already a member — silently ignore
+    if (channel.isMember(client.getFd()))
+        return;
+
+    if (!isNew)
+    {
+        // +i invite-only check
+        if (channel.isInviteOnly() && !channel.isInvited(client.getFd()))
+        {
+            sendToClient(client.getFd(),
+                ":server 473 " + client.getnickname() + " " + chanName +
+                " :Cannot join channel (+i)");
+            return;
+        }
+        // +k key check
+        if (channel.hasKey())
+        {
+            std::string givenKey = (msg.params.size() >= 2) ? msg.params[1] : "";
+            if (givenKey != channel.getKey())
+            {
+                sendToClient(client.getFd(),
+                    ":server 475 " + client.getnickname() + " " + chanName +
+                    " :Cannot join channel (+k)");
+                return;
+            }
+        }
+        // +l user limit check
+        if (channel.hasUserLimit() &&
+            channel.memberCount() >= static_cast<size_t>(channel.getUserLimit()))
+        {
+            sendToClient(client.getFd(),
+                ":server 471 " + client.getnickname() + " " + chanName +
+                " :Cannot join channel (+l)");
+            return;
+        }
+    }
+
+    // Add member (and operator if first to join)
+    channel.addMember(client.getFd());
+    if (isNew)
+        channel.addOperator(client.getFd());
+
+    // Remove from invite list now that they've joined
+    channel.removeInvited(client.getFd());
+
+    // Broadcast JOIN to everyone in the channel (including the joiner)
+    std::string joinMsg = ":" + getPrefix(client) + " JOIN " + chanName;
+    const std::set<int>& members = channel.getMembers();
+    for (std::set<int>::const_iterator it = members.begin();
+         it != members.end(); ++it)
+        sendToClient(*it, joinMsg);
+
+    // Send topic to joining client
+    if (channel.hasTopic())
+        sendToClient(client.getFd(),
+            ":server 332 " + client.getnickname() + " " + chanName +
+            " :" + channel.getTopic());
+    else
+        sendToClient(client.getFd(),
+            ":server 331 " + client.getnickname() + " " + chanName +
+            " :No topic is set");
+
+    // 353 RPL_NAMREPLY — list of members
+    std::string namesList = "";
+    for (std::set<int>::const_iterator it = members.begin();
+         it != members.end(); ++it)
+    {
+        std::map<int, Client>::iterator cit = clients.find(*it);
+        if (cit == clients.end())
+            continue;
+        if (!namesList.empty())
+            namesList += " ";
+        if (channel.isOperator(*it))
+            namesList += "@";
+        namesList += cit->second.getnickname();
+    }
+    sendToClient(client.getFd(),
+        ":server 353 " + client.getnickname() + " = " + chanName +
+        " :" + namesList);
+
+    // 366 RPL_ENDOFNAMES
+    sendToClient(client.getFd(),
+        ":server 366 " + client.getnickname() + " " + chanName +
+        " :End of /NAMES list");
 }
 
+// ─── KICK ─────────────────────────────────────────────────────────────────────
 
-// PRIVMSG — send a message to a channel or a user
-// msg.params[0] = target (channel name or nickname)
-// msg.params[1] = message text
-//
-// What to do:
-//   See the detailed plan already discussed.
-//   Use getPrefix(client) for the sender identity.
-//   Use findChannel() for channel targets.
-//   Use findClientByNick() for nickname targets.
-//   Use sendToClient() for delivery.
-//   Remember: sender does NOT receive their own channel message.
+void Server::handleKick(Client& client, const Message& msg)
+{
+    if (!client.isAuthenticated())
+    {
+        sendToClient(client.getFd(), ":server 451 * :You have not registered");
+        return;
+    }
+    if (msg.params.size() < 2)
+    {
+        sendToClient(client.getFd(),
+            ":server 461 " + client.getnickname() + " KICK :Not enough parameters");
+        return;
+    }
+
+    const std::string& chanName  = msg.params[0];
+    const std::string& targetNick = msg.params[1];
+    std::string reason = (msg.params.size() >= 3) ? msg.params[2] : "Kicked";
+
+    Channel* channel = findChannel(chanName);
+    if (!channel)
+    {
+        sendToClient(client.getFd(),
+            ":server 403 " + client.getnickname() + " " + chanName +
+            " :No such channel");
+        return;
+    }
+    // Sender must be in the channel
+    if (!channel->isMember(client.getFd()))
+    {
+        sendToClient(client.getFd(),
+            ":server 442 " + client.getnickname() + " " + chanName +
+            " :You're not on that channel");
+        return;
+    }
+    // Sender must be an operator
+    if (!channel->isOperator(client.getFd()))
+    {
+        sendToClient(client.getFd(),
+            ":server 482 " + client.getnickname() + " " + chanName +
+            " :You're not channel operator");
+        return;
+    }
+
+    Client* target = findClientByNick(targetNick);
+    if (!target || !channel->isMember(target->getFd()))
+    {
+        sendToClient(client.getFd(),
+            ":server 441 " + client.getnickname() + " " + targetNick +
+            " " + chanName + " :They aren't on that channel");
+        return;
+    }
+
+    // Broadcast KICK to everyone in the channel before removing the target
+    std::string kickMsg = ":" + getPrefix(client) + " KICK " + chanName +
+                          " " + targetNick + " :" + reason;
+    const std::set<int>& members = channel->getMembers();
+    for (std::set<int>::const_iterator it = members.begin();
+         it != members.end(); ++it)
+        sendToClient(*it, kickMsg);
+
+    channel->removeMember(target->getFd());
+}
+
+// ─── INVITE ───────────────────────────────────────────────────────────────────
+
+void Server::handleInvite(Client& client, const Message& msg)
+{
+    if (!client.isAuthenticated())
+    {
+        sendToClient(client.getFd(), ":server 451 * :You have not registered");
+        return;
+    }
+    if (msg.params.size() < 2)
+    {
+        sendToClient(client.getFd(),
+            ":server 461 " + client.getnickname() + " INVITE :Not enough parameters");
+        return;
+    }
+
+    const std::string& targetNick = msg.params[0];
+    const std::string& chanName   = msg.params[1];
+
+    Channel* channel = findChannel(chanName);
+    if (!channel)
+    {
+        sendToClient(client.getFd(),
+            ":server 403 " + client.getnickname() + " " + chanName +
+            " :No such channel");
+        return;
+    }
+    // Sender must be in the channel
+    if (!channel->isMember(client.getFd()))
+    {
+        sendToClient(client.getFd(),
+            ":server 442 " + client.getnickname() + " " + chanName +
+            " :You're not on that channel");
+        return;
+    }
+    // If +i, only operators can invite
+    if (channel->isInviteOnly() && !channel->isOperator(client.getFd()))
+    {
+        sendToClient(client.getFd(),
+            ":server 482 " + client.getnickname() + " " + chanName +
+            " :You're not channel operator");
+        return;
+    }
+
+    Client* target = findClientByNick(targetNick);
+    if (!target)
+    {
+        sendToClient(client.getFd(),
+            ":server 401 " + client.getnickname() + " " + targetNick +
+            " :No such nick/channel");
+        return;
+    }
+    // Already in the channel
+    if (channel->isMember(target->getFd()))
+    {
+        sendToClient(client.getFd(),
+            ":server 443 " + client.getnickname() + " " + targetNick +
+            " " + chanName + " :is already on channel");
+        return;
+    }
+
+    channel->addInvited(target->getFd());
+
+    // 341 RPL_INVITING to sender
+    sendToClient(client.getFd(),
+        ":server 341 " + client.getnickname() + " " + targetNick +
+        " " + chanName);
+
+    // INVITE notice to target
+    sendToClient(target->getFd(),
+        ":" + getPrefix(client) + " INVITE " + targetNick + " :" + chanName);
+}
+
+// ─── QUIT ─────────────────────────────────────────────────────────────────────
+
+void Server::handleQuit(Client& client, const Message& msg)
+{
+    std::string reason = msg.params.empty() ? "Leaving" : msg.params[0];
+    std::string quitMsg = ":" + getPrefix(client) + " QUIT :" + reason;
+
+    // Broadcast to every channel this client is in
+    std::set<int> notified;
+    for (std::map<std::string, Channel>::iterator ch = channels.begin();
+         ch != channels.end(); ++ch)
+    {
+        if (!ch->second.isMember(client.getFd()))
+            continue;
+        const std::set<int>& members = ch->second.getMembers();
+        for (std::set<int>::const_iterator m = members.begin();
+             m != members.end(); ++m)
+        {
+            if (*m != client.getFd() && notified.find(*m) == notified.end())
+            {
+                sendToClient(*m, quitMsg);
+                notified.insert(*m);
+            }
+        }
+    }
+
+    removeClient(client.getFd());
+}
+
+// ─── YOUR HANDLERS ────────────────────────────────────────────────────────────
+// PRIVMSG, TOPIC, MODE — implement these below.
+
 void Server::handlePrivmsg(Client& client, const Message& msg)
 {
     (void)client;
@@ -124,13 +485,6 @@ void Server::handlePrivmsg(Client& client, const Message& msg)
     // YOUR CODE HERE
 }
 
-
-// TOPIC — view or change the topic of a channel
-// msg.params[0] = channel name
-// msg.params[1] = new topic (optional — if absent, just view)
-//
-// What to do:
-//   See the detailed plan already discussed.
 void Server::handleTopic(Client& client, const Message& msg)
 {
     (void)client;
@@ -138,74 +492,7 @@ void Server::handleTopic(Client& client, const Message& msg)
     // YOUR CODE HERE
 }
 
-
-// MODE — change channel modes
-// msg.params[0] = channel name
-// msg.params[1] = mode string (e.g. "+i", "-k", "+o")
-// msg.params[2] = mode argument if needed (key, nickname, limit)
-//
-// What to do:
-//   See the detailed plan already discussed.
-//   Handle: +i -i +t -t +k -k +o -o +l -l
 void Server::handleMode(Client& client, const Message& msg)
-{
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
-}
-
-
-// KICK — eject a client from a channel
-// msg.params[0] = channel name
-// msg.params[1] = nickname to kick
-// msg.params[2] = kick reason (optional)
-//
-// What to do:
-//   1. Check authenticated
-//   2. findChannel — send 403 if not found
-//   3. Check sender is operator — send 482 if not
-//   4. findClientByNick(params[1]) — send 441 if not in channel
-//   5. channel.removeMember(target fd)
-//   6. Broadcast to all channel members (including kicked):
-//      ":nick!user@host KICK #channel targetNick :reason"
-void Server::handleKick(Client& client, const Message& msg)
-{
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
-}
-
-
-// INVITE — invite a client to a channel
-// msg.params[0] = nickname to invite
-// msg.params[1] = channel name
-//
-// What to do:
-//   1. Check authenticated
-//   2. findChannel — send 403 if not found
-//   3. Check sender is member — send 442 if not
-//   4. If channel is +i: check sender is operator — send 482 if not
-//   5. findClientByNick(params[0]) — send 401 if not found
-//   6. channel.addInvited(target fd)
-//   7. Send 341 to sender: ":server 341 senderNick targetNick #channel"
-//   8. Send to target: ":nick!user@host INVITE targetNick :#channel"
-void Server::handleInvite(Client& client, const Message& msg)
-{
-    (void)client;
-    (void)msg;
-    // YOUR CODE HERE
-}
-
-
-// QUIT — client disconnects gracefully
-// msg.params[0] = quit message (optional)
-//
-// What to do:
-//   1. Build quit reason string (use params[0] if present, else "Leaving")
-//   2. Broadcast to all channels the client is in:
-//      ":nick!user@host QUIT :reason"
-//   3. Call removeClient(client.getFd())
-void Server::handleQuit(Client& client, const Message& msg)
 {
     (void)client;
     (void)msg;

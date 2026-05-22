@@ -1,6 +1,11 @@
 #include "Channel.hpp"
 
-// ─── Constructor ─────────────────────────────────────────────────────────────
+// ─── Constructors ────────────────────────────────────────────────────────────
+
+Channel::Channel()
+    : name(""), topic(""), key(""), userLimit(0),
+      inviteOnly(false), topicRestricted(false)
+{}
 
 Channel::Channel(const std::string& channelName)
     : name(channelName),
